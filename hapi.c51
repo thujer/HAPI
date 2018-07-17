@@ -1,0 +1,522 @@
+
+  //-------------------------------------------------------------------------//
+  /////////////////////////////////////////////////////////////////////////////
+  // +---------------------------------------------------------------------+ //
+  // |                 Hybrid Adressable Peripheral Interface              | //
+  // |                  Synchronniho poloduplex rozhrani (2bit)            | //
+  // |                  -------------------------------------              | //
+  // |                       Verze 2.02a Build 071203                      | //
+  // |                         Tomas Hujer (c) 2007                        | //
+  // +---------------------------------------------------------------------+ //
+  // |  Zakladni princip komunikace vychazi z SPI, oproti puvodnimu        | //
+  // |  konceptu je ale rozsiren o moznost pripojeni vice zarizeni         | //
+  // |  na sbernici, adresaci zarizeni a volitelnou sirkou sbernice.       | //
+  // |  Maximalni pocet adresovatelnych zarizeni na sbernici zavisi        | //
+  // |  na jeji sirce, zarizeni jsou adresovana datovymi draty.            | //
+  // |  Na sbernici muze byt zarizeni i vice nez je mozne adresovat,       | //
+  // |  ovsem tyto zarizeni nemohou data prijimat ale pouze vysilat.       | //
+  // |  Sbernice je poloduplexni, vsechny draty jsou sdilene vsemi         | //
+  // |  zarizenimi. Vsechna zarizeni sleduji komunikaci a udrzuji          | //
+  // |  si vlastni virtualni status sbernice.                              | //
+  // |                                                                     | //
+  // | Popis komunikace:                                                   | //
+  // | 2 bity jsou ridici a 2 datove. Kazdy smer komunikace ma svuj        | //
+  // | handshake. Na datovych pinech se stridave prenasi informace         | //
+  // | o aktualne prenasenem halfniblu (0-4) a samotna data.               | //
+  // +---------------------------------------------------------------------+ //
+  /////////////////////////////////////////////////////////////////////////////
+  //-------------------------------------------------------------------------//
+
+
+#include <reg52.h>
+#include <stdio.h>
+#include "hapi.h"      
+#include "hapi.def"
+#include "timers.h"
+#include "timers.def"
+
+//------------------------------------------------------------------------------
+extern char code ** code result_string[] = {
+                "OK",
+                "ERROR: ID MATCH",
+                "ERROR: TIMEOUT BITMASK",
+                "ERROR: TIMEOUT DATA",
+                "ERROR: RESULT CODE",
+                "ERROR: SEND - ADRESS CHECK",
+                "ERROR: SEND - BITINDEX CHECK",
+                "ERROR: SEND - DATA CHECK",
+                "ERROR: SEND - EOT TIMEOUT"
+        };
+
+typedef enum {
+                HAPI_RESULT_OK = 0,
+                HAPI_RESULT_ERROR_ID,
+                HAPI_RESULT_ERROR_TIMEOUT_BITMASK,
+                HAPI_RESULT_ERROR_TIMEOUT_DATA,
+                HAPI_RESULT_ERROR_TIMEOUT_RESULT_CODE,
+                hapi_snd_result_code_SEND_ADDRESS_ERROR,
+                hapi_snd_result_code_SEND_BITINDEX_ERROR,
+                hapi_snd_result_code_SEND_DATA_ERROR,
+                HAPI_RESULT_ERROR_SEND_TIMEOUT_EOT
+             };
+
+
+//------------------------------------------------------------------------------
+char idata hapi_dest_device_id = HAPI_DEST_DEFAULT;      // ID ciloveho zarizeni na sbernici (nastavit pred odesilanim)
+char idata hapi_this_device_id = HAPI_MY_DEVICE_ID;      // vlastni ID na sbernici
+char idata hapi_inchar = 0;                              // prichozi znak
+char idata bit_mask_index = 0;                           // bitova maska pro prijem / vysilani
+char idata hapi_state = 0;                               // aktualni stav prijmu / vysilani
+char idata hapi_snd_result_code = 0;                     // chybovy kod posledni operace
+char idata hapi_rec_result_code = 0;                     // chybovy kod posledni operace
+
+char idata hapi_rec_ix_wr;                               // index pro zapis do prijimaciho bufferu
+char idata hapi_rec_ix_rd;                               // index pro cteni z prijimaciho bufferu
+char idata hapi_rec_in;                                  // pocet byte v prijimaciho bufferu
+char xdata hapi_rec_buf[HAPI_RECBUF_SIZE];               // prijimaci buffer
+
+//------------------------------------------------------------------------------
+bit  hapi_receive_result_error = 0;
+bit  D0_temp = 0;
+bit  D1_temp = 0;
+
+bit  HSI_temp = 0;
+bit  HSO_temp = 0;
+
+bit  hapi_receiving = 0;  // priznak probihajiciho prijimani zpravy
+bit  hapi_sending = 0;    // priznak probihajiciho odesilani zpravy
+bit  hapi_busy = 0;       // priznak probihajici komunikace (vlastni nebo cizi)
+
+//------------------------------------------------------------------------------
+
+
+
+// +-------------------------------------------------+
+// |                    Pins reset                   |
+// +-------------------------------------------------+
+void hapi_pin_reset()
+{
+    HSI = 1;
+    HSO = 1;
+    D0  = 1;
+    D1  = 1;
+}
+
+
+// +-------------------------------------------------+
+// |             HAPI text result code               |
+// +-------------------------------------------------+
+char *hapi_result_string()
+{
+    return(result_string[hapi_snd_result_code]);
+}
+
+
+
+// +-------------------------------------------------+
+// |                 Signal testing                  |
+// +-------------------------------------------------+
+// | Cekaci smycka, ceka se dokud je signal, pokud   |
+// | signal zmeni hodnotu na 1, je smycka ukoncena   |
+// | a vracena hodnota 0, pokud vyprsi cas, je       |
+// | nastaven chybovy status hapi_snd_result_code,       |
+// | resetovany komunikacni piny a vracena 1         |
+// +-------------------------------------------------+
+bit hapi_test_signal(bit level, int time, char error_result_code)
+{
+    TIMER_HAPI = time;                                                        // nastav timeout
+    while(HSI == level)                                                       // cekej dokud ma signal spec. uroven
+    {
+        if(!TIMER_HAPI)                                                       // pokud vyprsel timeout
+        {
+            hapi_snd_result_code = error_result_code;                             // nastav cislo chyby
+            hapi_pin_reset();                                                 // resetuj piny
+            return(1);                                                        // vrat 1
+        }
+    }
+    return(0);                                                                // pokud byl signal, vrat 0
+}
+
+
+
+// +------------------------------------+
+// |     Set data byte to data pins     |
+// +------------------------------------+
+void hapi_set_data(char data_byte)
+{
+    D0 = ((data_byte & 1)?1:0);
+    D1 = ((data_byte & 2)?1:0);
+}
+
+
+
+// +------------------------------------+
+// |    Get data byte from data pins    |
+// +------------------------------------+
+char hapi_get_data()
+{
+    char data_byte = 0;
+
+    data_byte = ((char) D0 | ((char) D1 << 1));  // zapis data z pinu do byte
+
+    return(data_byte);
+}
+
+
+
+// +-------------------------------------------------+
+// |             HAPI device output routine          |
+// +-------------------------------------------------+
+char hapi(char c)
+{ 
+    char hapi_bit_index = 0;
+    char hapi_bit_mask = 0;
+    char hapi_error_repeat = 0;
+
+    if(hapi_dest_device_id != hapi_this_device_id)
+    {
+        HSI = HSO = 1;                                                          // handshakes jako vstupy
+    
+        // -------------------------------------------------------------------
+        // Nastav na datove sbernici destination device ID
+        D0 = (bit) (hapi_dest_device_id);              
+        D1 = (bit) (hapi_dest_device_id >> 1);
+        HSO = 0;                                                                // shod handshake
+        //printf("HAPI,SND: set device ID: %i\n", (int) hapi_dest_device_id);
+
+        // -------------------------------------------------------------------
+        // Cekej na shozeni HSI (potvrzeni prevzeti dat)
+        if(hapi_test_signal(1, HAPI_SND_TIMEOUT, HAPI_RESULT_ERROR_TIMEOUT_BITMASK))
+            return(0);
+
+        // -------------------------------------------------------------------
+        // Nastav datove piny jako vstupy,
+        // otestuj zda je device_id spravne nastaveno ve vybranem zarizeni
+        // zapis poradi byte (0-3)
+        // nastav HSO
+        D0 = D1 = 1;                                                   // Nastav datove piny jako vstupy
+        //printf("HAPI,SND: check device ID: ");
+        if(((D0 != (hapi_dest_device_id & 1))) ||
+           (D1 != ((hapi_dest_device_id & 2) >> 1)))                   // zkontroluj zda je adresa ok
+        {
+            hapi_snd_result_code = hapi_snd_result_code_SEND_ADDRESS_ERROR;   // pripadne nastav chybu
+            //printf("ERROR\n");
+        }
+        //else
+        //    printf("OK\n");
+
+        hapi_error_repeat = 3;                                         // nastav pocet pokusu
+
+        // -------------------------------------------------------------------
+        for(hapi_bit_index = 0; hapi_bit_index < 4; hapi_bit_index++)
+        {
+            SEND_ERROR_REPEAT:
+            // -----------------------------------------------------------
+            // Nastav na datove sbernici poradi bitu ktere budou nasledovat
+            D0 = D0_temp = (hapi_bit_index & 1);                           // zapis poradi bitu do D0 
+            D1 = D1_temp = (hapi_bit_index & 2) >> 1;                      // zapis poradi bitu do D1 
+            HSO = 1;                                                       // potvrd nahozenim HSO
+            //printf("HAPI,SND: set bitix: %i\n", (int) hapi_bit_index);
+
+            // -----------------------------------------------------------
+            // Cekej na nahozeni HSI
+            if(hapi_test_signal(0, HAPI_SND_TIMEOUT, HAPI_RESULT_ERROR_TIMEOUT_BITMASK))
+                return(0);
+
+            // -----------------------------------------------------------
+            // Nastav datove piny jako vstupy
+            // otestuj zda je bit_index spravne nastaven
+            D0 = D1 = 1;                                                         // Nastav datove piny jako vstupy
+            //printf("HAPI,SND: check bitix: ");
+            if((D0 != D0_temp) || 
+               (D1 != D1_temp))                                                  // Zkontroluj zapsanou hodnotu
+            {
+                hapi_snd_result_code = hapi_snd_result_code_SEND_BITINDEX_ERROR;            // pripadne nastav chybu
+                //printf("ERROR\n");
+                return(0);
+            }
+            //else
+                //printf("OK\n");
+
+            // -----------------------------------------------------------
+            // Zapis maskovana data na datovou sbernici
+            // Shod HSO
+            
+            hapi_bit_mask = (1 << (hapi_bit_index*2+0));
+            //printf("HAPI,SND: masked0: %u\n", (int) (c & hapi_bit_mask));
+            D0 = D0_temp = ((c & hapi_bit_mask)?1:0);                            // vymaskuj a zapis bit D0 (LOW)
+
+            hapi_bit_mask = (1 << (hapi_bit_index*2+1));
+            //printf("HAPI,SND: masked1: %u\n", (int) (c & hapi_bit_mask));
+            D1 = D1_temp = ((c & hapi_bit_mask)?1:0);                            // vymaskuj a zapis bit D1 (HIGH)
+    
+            //printf("HAPI,SND: set data:<%c> D0: %c, D1: %c\n", c, D0_temp?'1':'0', D1_temp?'1':'0');
+        
+            HSO = 0;
+
+            // -----------------------------------------------------------
+            // Cekej na shozeni HSI
+            if(hapi_test_signal(1, HAPI_SND_TIMEOUT, HAPI_RESULT_ERROR_TIMEOUT_DATA))
+                return(0);
+        
+            // -----------------------------------------------------------
+            // Nastav datove piny jako vstupni
+            // Zkontroluj spravnost dat na sbernici
+            D0 = D1 = 1;                                                         // Nastav datove piny jako vstupy
+            //printf("HAPI,SND: check data:  D0: %c, D1: %c ... ", D0?'1':'0', D1?'1':'0');
+            if((D0 != D0_temp) || 
+               (D1 != D1_temp))                                                  // Zkontroluj zapsanou hodnotu
+            {
+                if(hapi_bit_index < 3)             // posledni bity nelze opravit, doslo by k desynchronizaci
+                {
+                    if(hapi_error_repeat)          // pokud neni vycerpan pocet pokusu
+                    {
+                        hapi_error_repeat--;       // odecti pokus
+                        goto SEND_ERROR_REPEAT;    // jdi znovu na odeslani bitoveho indexu
+                    }
+                }
+                hapi_snd_result_code = hapi_snd_result_code_SEND_DATA_ERROR;            // pripadne nastav chybu
+                //printf("ERROR\n");
+                return(0);
+            }
+            //else
+                //printf("OK\n");
+        }
+
+        // -----------------------------------------------------------
+        // Cekej na nahozeni HSI
+        if(hapi_test_signal(1, HAPI_SND_TIMEOUT, HAPI_RESULT_ERROR_TIMEOUT_RESULT_CODE))
+            return(0);
+
+        // -----------------------------------------------------------
+        // Odesli chybovy stav odesilani
+        hapi_set_data(hapi_snd_result_code);
+        HSO = 1;
+        // -----------------------------------------------------------
+
+        //printf("HAPI,SND: --- TRANSMIT END --- \n\n");
+
+        if(hapi_test_signal(0, HAPI_SND_TIMEOUT, HAPI_RESULT_ERROR_SEND_TIMEOUT_EOT))
+            return(0);
+
+        hapi_snd_result_code = HAPI_RESULT_OK;
+        return(c);
+    }
+    else
+    {
+        hapi_snd_result_code = HAPI_RESULT_ERROR_ID;
+        return(0);
+    }
+
+}
+
+
+
+// +------------------------------------+
+// |   Get incoming char from buffer    |
+// +------------------------------------+
+char hapi_getchar()
+{
+    char out;
+
+    if(hapi_rec_in)
+    {
+        hapi_rec_ix_rd %= HAPI_RECBUF_SIZE;               // rotace indexu
+        out = hapi_rec_buf[hapi_rec_ix_rd];               // nacti znak z prijimaciho bufferu
+        hapi_rec_ix_rd++;                                 // posun index pro cteni
+        hapi_rec_in--;                                    // sniz pocet znaku v bufferu
+        return(out);
+    }
+    return(0);
+}
+
+
+
+// +-------------------------------+
+// |     Incoming data process     |
+// +-------------------------------+
+void hapi_proc(void)
+{
+    typedef enum {
+                    HAPI_PROC_GET_ADRRESS = 0,
+                    HAPI_PROC_GET_DATA_INDEX,
+                    HAPI_PROC_GET_DATA,
+                    HAPI_PROC_GET_RESULT,
+                    HAPI_PROC_WAIT_END,
+                    HAPI_PROC_STOP
+    };
+
+    char data_in = 0;    
+
+    switch(hapi_state)
+    {
+        case HAPI_PROC_GET_ADRRESS:        
+            if(~HSI)                                             // Cekej na shozeni HSI
+            {
+                if(~hapi_busy)                                   // pokud jiz neprobiha komunikace
+                {
+                    hapi_busy = 1;                               // nastav priznak obsazene komunikace (i kdyz neni vlastni)
+
+                    //printf("HAPI,REC: interface busy\n");
+
+                    TIMER_HAPI = HAPI_REC_TIMEOUT;               // nastav timeout
+        
+                    if(hapi_get_data() == hapi_this_device_id )  // pokud je na datove sbernici tva adresa
+                    {
+                        //printf("HAPI,REC: calling me\n");
+
+                        hapi_receiving = 1;                      // nastav flag prijmu
+                                                              
+                        hapi_set_data(hapi_this_device_id);      // Nastav datove bity na tve DEVICE_ID (pro check)
+                        HSO = 0;                                 // Potvrd to shozenim HSO
+
+                        hapi_inchar = 0;                         // vynuluj prijimaci znak
+
+                        hapi_state = HAPI_PROC_GET_DATA_INDEX;   // jdi na dalsi stav
+                    }
+                }
+                else
+                {
+                    //printf("HAPI,REC: wait fo end\n");
+                    TIMER_HAPI = HAPI_QUIET_TIMEOUT;
+                    hapi_state = HAPI_PROC_WAIT_END;  
+                }
+            }
+            break;
+
+        case HAPI_PROC_GET_DATA_INDEX:
+            if(HSI)                                          // Cekej na nahozeni HSI
+            {
+                TIMER_HAPI = HAPI_REC_TIMEOUT;               // nastav timeout
+                hapi_set_data(0xFF);                         // Nastav datove piny jako vstupy
+                bit_mask_index = hapi_get_data();            // nacti index bitove masky
+                //printf("HAPI,REC: incoming bitmask index: %i\n", (int) bit_mask_index);
+                hapi_set_data(bit_mask_index);               // zapis index zpet pro check
+                HSO = 1;                                     // potvrd prijeti nastavenim HSO
+                hapi_state = HAPI_PROC_GET_DATA;             // jdi na dalsi stav
+            }
+            else
+            {
+                if(!TIMER_HAPI)
+                    hapi_state = HAPI_PROC_STOP;
+
+            }
+            break;
+
+        
+        case HAPI_PROC_GET_DATA:                                      
+            if(~HSI)                                                      // Cekej na shozeni HSI
+            {
+                if(hapi_rec_in < HAPI_RECBUF_SIZE)                        // pokud je v prijimacim bufferu misto
+                {
+                    hapi_rec_ix_wr %= HAPI_RECBUF_SIZE;                   // rotuj index
+
+                    hapi_set_data(0xFF);                                  // Nastav datove piny jako vstupy
+                    data_in = hapi_get_data();
+                    data_in &= 3;
+                    //printf("HAPI,REC: D0:%c, D1:%c\n", (data_in&1)?'1':'0', (data_in&2)?'1':'0');
+                    hapi_set_data(data_in);                               // zapis data zpet na sbernici pro check
+
+                    hapi_inchar |= (data_in << (bit_mask_index * 2));     // zapis data z pinu na sve misto v byte
+                    HSO = 0;                                              // nastav HSO, potvrzeni prevzeti
+                                                                                
+                    //printf("HAPI,REC: ix: %i\n", (int) bit_mask_index);
+                    if(bit_mask_index >= 3)
+                    {
+                        hapi_rec_buf[hapi_rec_ix_wr] = hapi_inchar;       // zapis znak do bufferu
+                        hapi_rec_ix_wr++;                                 // posun index
+                        hapi_rec_in++;                                    // pripocti pocet znaku v bufferu
+
+                        hapi_state = HAPI_PROC_GET_RESULT;
+                        //printf("HAPI,REC: databyte: %i, complete\n", (int) hapi_inchar);
+                    }
+                    else
+                    {
+                        //printf("HAPI,REC: databyte %i\n", (int) hapi_inchar);
+                        hapi_state = HAPI_PROC_GET_DATA_INDEX;          // jdi zpet na index dat
+                    }
+
+                }
+            }
+            else
+            {
+                if(!TIMER_HAPI)
+                    hapi_state = HAPI_PROC_STOP;
+
+            }
+            break;
+
+        case HAPI_PROC_GET_RESULT:
+            if(HSI)                                                   // Cekej na shozeni HSI
+            {
+                hapi_set_data(0xFF);                                  // Nastav datove piny jako vstupy
+                hapi_rec_result_code = hapi_get_data();               // nacti chybovy kod
+                HSO = 1;                                              // nastav HSO, potvrzeni prevzeti
+                hapi_state = HAPI_PROC_STOP;                          // jdi na proces ukonceni komunikace
+            }
+            else
+            {
+                if(!TIMER_HAPI)
+                    hapi_state = HAPI_PROC_STOP;
+
+            }
+            break;
+
+        case HAPI_PROC_WAIT_END:
+            if((HSI != HSI_temp) || (HSO != HSO_temp))                        // pokud zmena na komunikaci
+            {
+                HSI_temp = HSI;                                               // uloz zmenu
+                HSO_temp = HSO;
+
+                TIMER_HAPI = HAPI_QUIET_TIMEOUT;                              // nastav timeout
+            }
+            else
+            {                                                                 // pokud vyprsel timeout 
+                if(!TIMER_HAPI)
+                {
+                    hapi_state = HAPI_PROC_STOP;                              // resetuj komunikaci
+                }
+            }
+            break;
+
+        // konec prijmu a komunikace
+        case HAPI_PROC_STOP:
+            //printf("HAPI,REC: --- kill ---\n");
+            hapi_receiving = 0;                      // shod flag prijimani znaku
+            hapi_busy = 0;                           // shod flag probihajici komunikace
+            hapi_pin_reset();                        // resetuj piny procesoru
+            hapi_state = 0;                          // resetuj stavovy automat
+            break;
+
+    }
+
+    /*
+    if(hapi_busy || hapi_receiving)             // pokud je komunikace obsazena, nebo je stale nasteven flag prijmu
+    {
+        if(HSO & HSI & D0 & D1)                 // pokud jsou piny v klidu
+        {
+            if(!TIMER_HAPI)                     // pokud vyprsel cas, uvolni komunikaci
+            {
+                hapi_busy = 0;                  // resetuj flag obsazene komunikace
+                hapi_receiving = 0;             // resetuj flag prijmu
+            }
+        }
+        else
+        {
+            //TIMER_HAPI = TIME_2SEC;
+        }
+    }
+    */
+}
+
+
+
+void hapi_init()
+{
+    hapi_pin_reset();
+    hapi_state = 0;
+
+    hapi_rec_ix_rd = 0;
+    hapi_rec_ix_wr = 0;
+    hapi_rec_in = 0;
+}

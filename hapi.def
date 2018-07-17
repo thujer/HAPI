@@ -1,0 +1,28 @@
+
+//------------------------------------------------------------------------------
+// pinout
+sbit HSI    =   P2^3;
+sbit HSO    =   P2^2;
+sbit D1     =   P2^1;
+sbit D0     =   P2^0;
+
+//------------------------------------------------------------------------------
+// definice ID pro zarizeni na komunikaci (0-3)
+#define  HAPI_DEVICE_GSMTINY    0
+#define  HAPI_DEVICE_CONFIG     1
+#define  HAPI_DEVICE_DET1       2 
+#define  HAPI_DEVICE_DET2       3
+
+//------------------------------------------------------------------------------
+// Definice vlastni adresy
+#define  HAPI_MY_DEVICE_ID  HAPI_DEVICE_GSMTINY
+#define  HAPI_DEST_DEFAULT  HAPI_DEVICE_CONFIG
+
+//------------------------------------------------------------------------------
+// Timeout pro preruseni komunikace
+#define  HAPI_SND_TIMEOUT      TIME_1SEC
+#define  HAPI_REC_TIMEOUT      TIME_1SEC
+#define  HAPI_QUIET_TIMEOUT    TIME_500MS
+
+//------------------------------------------------------------------------------
+#define HAPI_RECBUF_SIZE 10
